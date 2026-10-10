@@ -1,6 +1,9 @@
+import statistics
+
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.stats import t
 
 import ffn
 
@@ -131,3 +134,69 @@ def test_tracking_error_tolerance_preserves_each_columns_precision(metric):
     )
 
     pd.testing.assert_series_equal(function(returns, benchmarks), expected)
+
+
+@pytest.mark.parametrize(
+    "dtype", ["int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64"]
+)
+@pytest.mark.parametrize("shape", ["series_series", "frame_series", "series_frame", "frame_frame"])
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("metric", ["calc_information_ratio", "calc_prob_mom"])
+def test_integer_subtraction_reaches_risk_statistics(dtype, shape, partial, metric):
+    limits = np.iinfo(dtype.lower())
+    index = pd.date_range("2024-01-01", periods=5 if partial else 4)
+    values = [0, 1, 2, 1] if dtype.lower().startswith("u") else [limits.min, 0, limits.max, 1]
+    returns = pd.Series(np.array(values, dtype=dtype.lower()), index=index[:4], dtype=dtype, name="asset")
+    benchmark_index = index[[0, 1, 2, 4]] if partial else index
+    benchmark = pd.Series(np.ones(4, dtype=dtype.lower()), index=benchmark_index, dtype=dtype, name="asset")
+    if partial and dtype[0].isupper():
+        returns.iloc[1] = pd.NA
+    left, right = returns.to_dict(), benchmark.to_dict()
+    # Python integers avoid overflow in the oracle; only observed date pairs determine the statistics and Student-t sample size.
+    differences = [int(left[date]) - int(right[date]) for date in index if date in left and date in right and not pd.isna(left[date])]
+    ratio = statistics.mean(differences) / statistics.stdev(differences)
+    expected = ratio if metric == "calc_information_ratio" else t.cdf(ratio * np.sqrt(len(differences)), len(differences) - 1)
+    first, second = shape.split("_")
+    data = returns.to_frame() if first == "frame" else returns
+    other = benchmark.to_frame() if second == "frame" else benchmark
+    original, original_other = data.copy(), other.copy()
+    for result in (getattr(ffn, metric)(data, other), getattr(data, metric)(other)):
+        # Ratios retain ordinary floating precision; the public subtraction test checks exact integers.
+        np.testing.assert_allclose(result, expected, rtol=1e-12, atol=1e-15)
+        if isinstance(result, pd.Series):
+            pd.testing.assert_index_equal(result.index, (data if first == "frame" else other).columns)
+    (pd.testing.assert_frame_equal if first == "frame" else pd.testing.assert_series_equal)(data, original)
+    (pd.testing.assert_frame_equal if second == "frame" else pd.testing.assert_series_equal)(other, original_other)
+
+
+@pytest.mark.parametrize("dtype", ["uint64", "UInt64"])
+@pytest.mark.parametrize("shape", ["frame_series", "series_frame", "frame_frame"])
+def test_integer_subtraction_converts_only_new_object_differentials_for_momentum(dtype, shape):
+    maximum = 2**64 - 1
+    returns = pd.Series(np.array([0, maximum, 2, maximum - 2], dtype="uint64"), dtype=dtype, name="asset")
+    benchmark = pd.Series(np.full(4, maximum, dtype="uint64"), dtype=dtype, name="asset")
+    differences = [-maximum, 0, 2 - maximum, -2]
+    ratio = statistics.mean(differences) / statistics.stdev(differences)
+    first, second = shape.split("_")
+    data = returns.to_frame() if first == "frame" else returns
+    other = benchmark.to_frame() if second == "frame" else benchmark
+    # SciPy must receive numeric statistics even when exact subtraction needs object storage.
+    np.testing.assert_allclose(data.calc_information_ratio(other), ratio)
+    result = data.calc_prob_mom(other)
+    np.testing.assert_allclose(result, t.cdf(ratio * 2, 3))
+    assert result.dtype.kind == "f"
+
+
+@pytest.mark.parametrize("metric", ["calc_information_ratio", "calc_prob_mom"])
+def test_integer_subtraction_keeps_date_and_column_pairing(metric):
+    index = pd.date_range("2024-01-01", periods=4)
+    returns = pd.DataFrame({"alpha": [0, 3, 2, 1], "beta": [4, 0, 4, 3]}, index=index, dtype="UInt8")
+    benchmark = pd.DataFrame({"alpha": [1, 2, 3, 1], "beta": [3, 1, 2, 4]}, index=index, dtype="UInt8")
+    benchmark = benchmark.loc[:, ["beta", "alpha"]].iloc[::-1]
+    # Distinct per-label values expose positional subtraction after either axis is reordered.
+    differences = [[-1, 1, -1, 0], [1, -1, 2, -1]]
+    ratios = [statistics.mean(values) / statistics.stdev(values) for values in differences]
+    expected = ratios if metric == "calc_information_ratio" else t.cdf(np.asarray(ratios) * 2, 3)
+    result = getattr(returns, metric)(benchmark)
+    np.testing.assert_allclose(result, expected)
+    pd.testing.assert_index_equal(result.index, returns.columns)

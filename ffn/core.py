@@ -1612,6 +1612,8 @@ def calc_sharpe(returns, rf=0.0, nperiods=None, annualize=True):
     Returns NaN when the aligned excess returns have no dispersion, independently for each
     DataFrame column.
 
+    Integer return/risk-free Series are subtracted exactly before floating statistical conversion.
+
     Args:
         * returns (Series, DataFrame): Input return series
         * rf (float, np.floating, Series): `Risk-free rate <https://www.investopedia.com/terms/r/risk-freerate.asp>`_ expressed as a yearly (annualized) return or *return*
@@ -1632,7 +1634,18 @@ def calc_sharpe(returns, rf=0.0, nperiods=None, annualize=True):
     if isinstance(rf, _FLOATING_SCALAR_TYPES) and rf != 0 and nperiods is None:
         raise ValueError("Must provide nperiods if rf != 0")
 
-    return _calc_sharpe(returns.to_excess_returns(rf, nperiods=nperiods), nperiods, annualize)
+    er = returns.to_excess_returns(rf, nperiods=nperiods)
+    # Normalize only object storage produced by integer pairs, preserving existing
+    # object-input behavior and the public exact excess-return result.
+    if isinstance(rf, pd.Series) and _fixed_integer_return_dtype(rf.dtype) is not None:
+        if isinstance(returns, pd.Series) and _fixed_integer_return_dtype(returns.dtype) is not None:
+            er = _numeric_integer_difference(er)
+        elif isinstance(returns, pd.DataFrame):
+            positions = [position for position, dtype in enumerate(returns.dtypes) if _fixed_integer_return_dtype(dtype) is not None and er.dtypes.iloc[position] == object]
+            if positions:
+                columns = [_numeric_integer_difference(er.iloc[:, position]) if position in positions else er.iloc[:, position] for position in range(er.shape[1])]
+                er = _return_difference_frame(er, columns)
+    return _calc_sharpe(er, nperiods, annualize)
 
 
 def _calc_sharpe(er, nperiods, annualize=True):
@@ -1670,6 +1683,105 @@ def _calc_sharpe(er, nperiods, annualize=True):
     return res
 
 
+def _fixed_integer_return_dtype(dtype):
+    """Recognize NumPy and nullable integers without changing other extension paths."""
+    if isinstance(dtype, np.dtype):
+        return dtype if dtype.kind in "iu" else None
+    if dtype.name in ("Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64"):
+        return dtype.numpy_dtype
+    return None
+
+
+def _numeric_integer_difference(difference):
+    """Convert only newly exact object differences at the statistical boundary."""
+    if difference.dtype == object:
+        # Replace nullable missing values before float coercion on older pandas.
+        return difference.where(difference.notna(), np.nan).astype(float)
+    return difference
+
+
+def _return_difference_frame(template, columns):
+    """Retain native frame metadata, duplicate labels and each column's storage."""
+    labels = template.columns
+    result = template.iloc[:, :0]
+    # Insertion replaces storage without requiring a newer pandas positional API.
+    for position, column in enumerate(columns):
+        result.insert(position, labels[position], column, allow_duplicates=True)
+    result.columns = labels
+    return result
+
+
+def _subtract_return_series(returns, other, numeric):
+    """Subtract integer pairs exactly, retaining native storage whenever it fits."""
+    if _fixed_integer_return_dtype(returns.dtype) is None or _fixed_integer_return_dtype(other.dtype) is None:
+        return returns - other
+
+    # Zero-valued operands preserve pandas' promotion and alignment rules without
+    # executing overflowing subtraction. Casting operands to float would erase
+    # small valid differences between large integers, so use Python integers first.
+    dtype = (returns * 0 - other * 0).dtype
+    difference = returns.astype(object) - other.astype(object)
+    observed = difference.dropna()
+    minimum = observed.min() if not observed.empty else 0
+    maximum = observed.max() if not observed.empty else 0
+    storage = getattr(dtype, "numpy_dtype", dtype)
+    if storage.kind in "iu":
+        limits = np.iinfo(storage)
+        exact_storage = limits.min <= minimum and maximum <= limits.max
+    else:
+        exact_storage = all(int(storage.type(value)) == value for value in observed)
+
+    if not exact_storage:
+        nullable = hasattr(dtype, "numpy_dtype") or difference.isna().any()
+        if -(2**63) <= minimum and maximum < 2**63:
+            dtype = "Int64" if nullable else "int64"
+        elif 0 <= minimum and maximum < 2**64:
+            dtype = "UInt64" if nullable else "uint64"
+        else:
+            dtype = object
+    difference = difference.astype(dtype)
+    return _numeric_integer_difference(difference) if numeric else difference
+
+
+def _subtract_returns(returns, other, numeric=False):
+    """Preserve native arithmetic except for paired fixed-width integer columns."""
+
+    def subtract(left, right):
+        if isinstance(left, pd.DataFrame) and isinstance(right, pd.Series):
+            return left.sub(right, axis="index")
+        if isinstance(left, pd.Series) and isinstance(right, pd.DataFrame):
+            return right.rsub(left, axis="index")
+        return left - right
+
+    containers = (pd.Series, pd.DataFrame)
+    if not isinstance(returns, containers) or not isinstance(other, containers):
+        return subtract(returns, other)
+    other_dtypes = other.dtypes if isinstance(other, pd.DataFrame) else [other.dtype]
+    if not any(_fixed_integer_return_dtype(dtype) is not None for dtype in other_dtypes):
+        return subtract(returns, other)
+    return_dtypes = returns.dtypes if isinstance(returns, pd.DataFrame) else [returns.dtype]
+    if not any(_fixed_integer_return_dtype(dtype) is not None for dtype in return_dtypes):
+        return subtract(returns, other)
+    if isinstance(returns, pd.Series) and isinstance(other, pd.Series):
+        return _subtract_return_series(returns, other, numeric)
+    if isinstance(returns, pd.DataFrame) and isinstance(other, pd.DataFrame):
+        left, right = returns.align(other, axis=1)
+        pairs = [(left.iloc[:, i], right.iloc[:, i]) for i in range(left.shape[1])]
+    elif isinstance(returns, pd.DataFrame):
+        pairs = [(returns.iloc[:, i], other) for i in range(returns.shape[1])]
+    else:
+        pairs = [(returns, other.iloc[:, i]) for i in range(other.shape[1])]
+    if not any(_fixed_integer_return_dtype(left.dtype) is not None and _fixed_integer_return_dtype(right.dtype) is not None for left, right in pairs):
+        return subtract(returns, other)
+
+    columns = [_subtract_return_series(left, right, numeric) for left, right in pairs]
+    # An empty native operation retains version-specific frame metadata and column
+    # alignment without executing fixed-width subtraction. Rebuild columns by position
+    # so duplicate names and mixed neighboring dtypes keep their native behavior.
+    template = subtract(returns.iloc[:0], other.iloc[:0]).reindex(columns[0].index)
+    return _return_difference_frame(template, columns)
+
+
 def _diff_returns(returns, benchmark_returns):
     """
     Subtracts benchmark_returns from returns along the date index.
@@ -1679,13 +1791,7 @@ def _diff_returns(returns, benchmark_returns):
     all-NaN frame the size of the calendar plus the column labels. Subtract
     along the index whenever the two arguments have different shapes.
     """
-    if isinstance(returns, pd.DataFrame) and isinstance(benchmark_returns, pd.Series):
-        return returns.sub(benchmark_returns, axis="index")
-
-    if isinstance(returns, pd.Series) and isinstance(benchmark_returns, pd.DataFrame):
-        return benchmark_returns.rsub(returns, axis="index")
-
-    return returns - benchmark_returns
+    return _subtract_returns(returns, benchmark_returns, numeric=True)
 
 
 def calc_information_ratio(returns, benchmark_returns):
@@ -2915,6 +3021,10 @@ def to_excess_returns(returns, rf, nperiods=None):
     A Series risk-free return is aligned to the return index. For DataFrame
     returns, it is subtracted from every column by date.
 
+    With a Series risk-free input, paired NumPy or nullable integer columns preserve
+    exact differences. Results retain native storage when exact, otherwise use
+    64-bit integer or object storage.
+
     Args:
         * returns (Series, DataFrame): Returns
         * rf (float, np.floating, Series): `Risk-Free rate(s) <https://www.investopedia.com/terms/r/risk-freerate.asp>`_ expressed in annualized term or return series
@@ -2936,8 +3046,8 @@ def to_excess_returns(returns, rf, nperiods=None):
         _rf = rf
 
     # A time-indexed risk-free Series applies to every asset column by date.
-    if isinstance(returns, pd.DataFrame) and isinstance(_rf, pd.Series):
-        return returns.sub(_rf, axis="index")
+    if isinstance(_rf, pd.Series):
+        return _subtract_returns(returns, _rf)
 
     return returns - _rf
 

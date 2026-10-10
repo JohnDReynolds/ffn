@@ -1,3 +1,5 @@
+import statistics
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -375,6 +377,186 @@ def test_performance_stats_same_holding_as_riskfree_has_no_daily_excess(calendar
     assert np.isnan(group["same_holding"].daily_sharpe)
     assert np.isnan(group["same_holding"].daily_sortino)
     pd.testing.assert_series_equal(risk_free, original_rf)
+
+
+@pytest.mark.parametrize(
+    "dtype", ["int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64"]
+)
+@pytest.mark.parametrize("as_frame", [False, True])
+@pytest.mark.parametrize("partial", [False, True])
+def test_excess_returns_integer_subtraction_is_exact(dtype, as_frame, partial):
+    limits = np.iinfo(dtype.lower())
+    index = pd.date_range("2024-01-01", periods=5 if partial else 4, name="dates")
+    # Construct extrema in their execution dtype before pandas can reinterpret them.
+    values = [0, 1, 2, 1] if dtype.lower().startswith("u") else [limits.min, 0, limits.max, 1]
+    returns = pd.Series(np.array(values, dtype=dtype.lower()), index=index[:4], dtype=dtype, name="asset")
+    rf_index = index[[0, 1, 2, 4]] if partial else index
+    risk_free = pd.Series(np.ones(4, dtype=dtype.lower()), index=rf_index, dtype=dtype, name="asset")
+    if partial and dtype[0].isupper():
+        returns.iloc[1] = pd.NA
+    left, right = returns.to_dict(), risk_free.to_dict()
+    # Date lookup and Python integers provide an oracle independent of pandas subtraction.
+    expected = [None if date not in left or date not in right or pd.isna(left[date]) else int(left[date]) - int(right[date]) for date in index]
+    data = returns.to_frame() if as_frame else returns
+    original, original_rf = data.copy(), risk_free.copy()
+    for result in (ffn.to_excess_returns(data, risk_free, nperiods=1), data.to_excess_returns(risk_free, nperiods=1)):
+        column = result.iloc[:, 0] if as_frame else result
+        pd.testing.assert_index_equal(column.index, index)
+        for actual, wanted in zip(column, expected):
+            assert pd.isna(actual) if wanted is None else int(actual) == wanted, (actual, wanted)
+    (pd.testing.assert_frame_equal if as_frame else pd.testing.assert_series_equal)(data, original)
+    pd.testing.assert_series_equal(risk_free, original_rf)
+
+
+@pytest.mark.parametrize("dtype", ["int64", "uint64", "Int64", "UInt64"])
+@pytest.mark.parametrize("as_frame", [False, True])
+def test_excess_returns_integer_subtraction_keeps_close_64bit_differences(dtype, as_frame):
+    index = pd.date_range("2024-01-01", periods=4)
+    # At 2**60, float64 loses these unit offsets; converting before subtraction would erase the differences.
+    returns = pd.Series(np.array([2**60 + i for i in (1, 2, 3, 4)], dtype=dtype.lower()), index=index, dtype=dtype, name="asset")
+    risk_free = pd.Series(np.full(4, 2**60, dtype=dtype.lower()), index=index, dtype=dtype, name="asset")
+    data = returns.to_frame() if as_frame else returns
+    expected = pd.Series([1, 2, 3, 4], index=index, dtype=dtype, name="asset")
+    if as_frame:
+        expected = expected.to_frame()
+    (pd.testing.assert_frame_equal if as_frame else pd.testing.assert_series_equal)(data.to_excess_returns(risk_free, nperiods=1), expected)
+    ratio = statistics.mean([1, 2, 3, 4]) / statistics.stdev([1, 2, 3, 4])
+    np.testing.assert_allclose(data.calc_sharpe(risk_free, nperiods=1), ratio)
+    # Exact subtraction must not change the existing input-scale tracking-error floor.
+    np.testing.assert_array_equal(np.asarray(data.calc_information_ratio(risk_free)), 0.0)
+    np.testing.assert_array_equal(np.asarray(data.calc_prob_mom(risk_free)), 0.5)
+
+
+@pytest.mark.parametrize("dtype", ["int64", "Int64"])
+def test_excess_returns_integer_subtraction_preserves_large_unpaired_values(dtype):
+    index = pd.date_range("2024-01-01", periods=5)
+    # Alignment introduces missing values, but matched integers must retain their unit precision.
+    returns = pd.Series(np.array([2**60 + i for i in (1, 2, 3, 4)], dtype="int64"), index=index[:4], dtype=dtype)
+    risk_free = pd.Series([0] * 4, index=index[[0, 1, 2, 4]], dtype=dtype)
+    # Partial native alignment retains no frequency, even when the union is regularly spaced.
+    expected_index = pd.DatetimeIndex(list(index))
+    expected = pd.Series([2**60 + 1, 2**60 + 2, 2**60 + 3, pd.NA, pd.NA], index=expected_index, dtype="Int64")
+    pd.testing.assert_series_equal(returns.to_excess_returns(risk_free, nperiods=1), expected)
+
+
+@pytest.mark.parametrize(
+    "left_dtype,right_dtype,expected_dtype", [("int64", "uint64", "float64"), ("uint64", "int64", "float64"), ("Int64", "UInt64", "Float64"), ("UInt64", "Int64", "Float64")]
+)
+@pytest.mark.parametrize("as_frame", [False, True])
+@pytest.mark.parametrize("partial", [False, True])
+def test_excess_returns_integer_subtraction_preserves_mixed_64bit_contrasts(left_dtype, right_dtype, expected_dtype, as_frame, partial):
+    index = pd.date_range("2024-01-01", periods=5 if partial else 4)
+    returns = pd.Series(np.array([2**60 + i for i in (1, 2, 3, 4)], dtype=left_dtype.lower()), index=index[:4], dtype=left_dtype, name="asset")
+    risk_free = pd.Series(np.full(4, 2**60, dtype=right_dtype.lower()), index=index[[0, 1, 2, 4]] if partial else index, dtype=right_dtype, name="asset")
+    # Mixed signed/unsigned 64-bit storage promotes to float, but only after exact subtraction.
+    expected = pd.Series([1, 2, 3, np.nan, np.nan] if partial else [1, 2, 3, 4], index=pd.DatetimeIndex(list(index)) if partial else index, dtype=expected_dtype, name="asset")
+    data = returns.to_frame() if as_frame else returns
+    target = expected.to_frame() if as_frame else expected
+    check = pd.testing.assert_frame_equal if as_frame else pd.testing.assert_series_equal
+    for result in (ffn.to_excess_returns(data, risk_free, nperiods=1), data.to_excess_returns(risk_free, nperiods=1)):
+        check(result, target)
+    differences = [1, 2, 3] if partial else [1, 2, 3, 4]
+    np.testing.assert_allclose(data.calc_sharpe(rf=risk_free, nperiods=1, annualize=False), statistics.mean(differences) / statistics.stdev(differences))
+
+
+@pytest.mark.parametrize("dtype,expected_dtype", [("int64", "uint64"), ("Int64", "UInt64")])
+@pytest.mark.parametrize("as_frame", [False, True])
+def test_excess_returns_integer_subtraction_uses_unsigned_storage_when_required(dtype, expected_dtype, as_frame):
+    returns = pd.Series(np.array([2**63 - i for i in (1, 2, 3, 4)], dtype="int64"), dtype=dtype, name="asset")
+    risk_free = pd.Series([-(2**63)] * 4, dtype=dtype, name="asset")
+    expected = pd.Series(np.array([2**64 - i for i in (1, 2, 3, 4)], dtype="uint64"), dtype=expected_dtype, name="asset")
+    data = returns.to_frame() if as_frame else returns
+    result = data.to_excess_returns(risk_free, nperiods=1)
+    (pd.testing.assert_frame_equal if as_frame else pd.testing.assert_series_equal)(result, expected.to_frame() if as_frame else expected)
+
+
+@pytest.mark.parametrize("dtype", ["uint64", "UInt64"])
+@pytest.mark.parametrize("as_frame", [False, True])
+@pytest.mark.parametrize("partial", [False, True])
+def test_excess_returns_integer_subtraction_uses_object_beyond_64bit_storage(dtype, as_frame, partial):
+    maximum = 2**64 - 1
+    index = pd.date_range("2024-01-01", periods=5 if partial else 4)
+    returns = pd.Series(np.array([0, maximum, 2, maximum - 2], dtype="uint64"), index=index[:4], dtype=dtype, name="asset")
+    rf_index = index[[0, 1, 2, 4]] if partial else index
+    risk_free = pd.Series(np.full(4, maximum, dtype="uint64"), index=rf_index, dtype=dtype, name="asset")
+    # Negative values below int64's minimum cannot share any fixed-width integer dtype.
+    paired = [-maximum, 0, 2 - maximum] + ([] if partial else [-2])
+    expected_index = pd.DatetimeIndex(list(index)) if partial else index
+    expected = pd.Series(paired + ([np.nan, np.nan] if partial else []), index=expected_index, dtype=object, name="asset")
+    data = returns.to_frame() if as_frame else returns
+    exact = data.to_excess_returns(risk_free, nperiods=1)
+    # Object storage preserves missingness without promising a particular null scalar.
+    canonical = exact.where(exact.notna(), np.nan)
+    (pd.testing.assert_frame_equal if as_frame else pd.testing.assert_series_equal)(canonical, expected.to_frame() if as_frame else expected)
+    ratio = statistics.mean(paired) / statistics.stdev(paired)
+    sharpe = data.calc_sharpe(risk_free, nperiods=1)
+    np.testing.assert_allclose(sharpe, ratio)
+    if as_frame:
+        assert sharpe.dtype.kind == "f"
+    else:
+        # Deflated Sharpe also consumes public excess returns, with the same effective sample.
+        reference = ffn.calc_deflated_sharpe_ratio(expected.astype(float), [0.1, 0.2, 0.3], nperiods=1, annualized_trials=False)
+        actual = data.calc_deflated_sharpe_ratio([0.1, 0.2, 0.3], rf=risk_free, nperiods=1, annualized_trials=False)
+        # Three paired observations leave kurtosis undefined; preserve that NaN too.
+        assert actual == pytest.approx(reference, nan_ok=True)
+
+
+@pytest.mark.parametrize("neighbor_dtype", ["float32", "Float32", object])
+def test_excess_returns_integer_subtraction_preserves_mixed_duplicate_columns(neighbor_dtype):
+    integer = pd.Series([0, 1, 2, 1], dtype="UInt8")
+    floating = pd.Series([0.1, 0.3, 0.8, 0.2], dtype=neighbor_dtype)
+    returns = pd.concat([integer, floating], axis=1)
+    returns.columns = pd.Index(["asset", "asset"], name="assets")
+    risk_free = pd.Series([1] * 4, dtype="UInt8")
+    original = returns.copy()
+    result = returns.to_excess_returns(risk_free, nperiods=1)
+    pd.testing.assert_series_equal(result.iloc[:, 0], pd.Series([-1, 0, 1, 0], dtype="Int64", name="asset"))
+    pd.testing.assert_series_equal(result.iloc[:, 1], returns.iloc[:, [1]].sub(risk_free, axis="index").iloc[:, 0])
+    pd.testing.assert_index_equal(result.columns, returns.columns)
+    pd.testing.assert_frame_equal(returns, original)
+
+
+@pytest.mark.parametrize("dtype", ["int8", "uint64", "Int8", "UInt64"])
+@pytest.mark.parametrize("as_frame", [False, True])
+def test_excess_returns_integer_subtraction_preserves_valid_storage_metadata_and_ownership(dtype, as_frame):
+    index = pd.date_range("2024-01-01", periods=4, tz="UTC", name="dates")
+    returns = pd.Series([3, 4, 6, 8], index=index, dtype=dtype, name="asset")
+    risk_free = pd.Series([1] * 4, index=index, dtype=dtype, name="asset")
+    data = pd.concat([returns, returns], axis=1) if as_frame else returns
+    if as_frame:
+        data.columns.name = "assets"
+    data.attrs = {"units": {"kind": "returns"}}
+    # A native, non-overflowing neighbor establishes version-specific metadata behavior.
+    expected = data.sub(risk_free, axis="index") if as_frame else data - risk_free
+    original, original_rf = data.copy(), risk_free.copy()
+    result = data.to_excess_returns(risk_free, nperiods=1)
+    check = pd.testing.assert_frame_equal if as_frame else pd.testing.assert_series_equal
+    check(result, expected)
+    assert result.attrs == expected.attrs
+    if as_frame:
+        result.iloc[0, 0] = 10
+    else:
+        result.iloc[0] = 10
+    check(data, original)
+    pd.testing.assert_series_equal(risk_free, original_rf)
+    saved = result.copy()
+    if as_frame:
+        data.iloc[1, 0] = 20
+    else:
+        data.iloc[1] = 20
+    risk_free.iloc[2] = 5
+    check(result, saved)
+
+
+@pytest.mark.parametrize("dtype", [object, "float32", "Float32", "Sparse[int64]"])
+def test_excess_returns_integer_subtraction_keeps_other_native_paths(dtype):
+    returns = pd.Series([3, 4, 6, 8], dtype=dtype, name="asset")
+    risk_free = pd.Series([1] * 4, dtype="int64", name="asset")
+    pd.testing.assert_series_equal(returns.to_excess_returns(risk_free, nperiods=1), returns - risk_free)
+    # Scalars and positional arrays retain the public helper's existing fall-through.
+    integer = pd.Series([3, 4, 6, 8], dtype="int64", name="asset")
+    for other in (0, 0.0, np.float32(0.0), np.array([1, 2, 3, 4])):
+        pd.testing.assert_series_equal(integer.to_excess_returns(other, nperiods=1), integer - other)
 
 
 def test_performance_stats_daily_riskfree_prices_match_asset_interval_oracle():
